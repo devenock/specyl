@@ -260,33 +260,53 @@ func (a *Analyzer) goTypeToSchema(expr ast.Expr) models.Schema {
 // addSchemaAndRefsToModels adds the schema and any referenced types to a.models so OpenAPI components/schemas can resolve $ref.
 func (a *Analyzer) addSchemaAndRefsToModels(name string, s models.Schema) {
 	a.models[name] = s
-	if s.Ref != "" {
-		refName := strings.TrimPrefix(s.Ref, "#/components/schemas/")
-		if refName != "" && refName != name {
-			if nested, ok := a.typeRegistry[refName]; ok {
-				a.addSchemaAndRefsToModels(refName, nested)
+	a.addReferencedModels(s)
+}
+
+// addReferencedModels adds every type s references, at any depth, to a.models.
+func (a *Analyzer) addReferencedModels(s models.Schema) {
+	visitSchemaRefs(s, func(refName string) {
+		if _, done := a.models[refName]; done {
+			return // also stops recursion on self-referential types
+		}
+		if nested, ok := a.typeRegistry[refName]; ok {
+			a.addSchemaAndRefsToModels(refName, nested)
+		}
+	})
+}
+
+// addModelsReferencedByEndpoints ensures every $ref reachable from an endpoint resolves, including refs inside inline schemas (e.g. handler-local structs) that were never added to a.models themselves.
+func (a *Analyzer) addModelsReferencedByEndpoints() {
+	for _, ep := range a.endpoints {
+		for _, p := range ep.Parameters {
+			a.addReferencedModels(p.Schema)
+		}
+		if ep.RequestBody != nil {
+			for _, c := range ep.RequestBody.Content {
+				a.addReferencedModels(c.Schema)
 			}
 		}
+		for _, resp := range ep.Responses {
+			for _, c := range resp.Content {
+				a.addReferencedModels(c.Schema)
+			}
+			for _, h := range resp.Headers {
+				a.addReferencedModels(h.Schema)
+			}
+		}
+	}
+}
+
+// visitSchemaRefs calls fn with the component name of every $ref in s, recursing into properties and items.
+func visitSchemaRefs(s models.Schema, fn func(refName string)) {
+	if refName := strings.TrimPrefix(s.Ref, "#/components/schemas/"); refName != "" {
+		fn(refName)
 	}
 	for _, prop := range s.Properties {
-		if prop.Ref != "" {
-			refName := strings.TrimPrefix(prop.Ref, "#/components/schemas/")
-			if refName != "" {
-				if nested, ok := a.typeRegistry[refName]; ok {
-					a.addSchemaAndRefsToModels(refName, nested)
-				}
-			}
-		}
+		visitSchemaRefs(prop, fn)
 	}
 	if s.Items != nil {
-		if s.Items.Ref != "" {
-			refName := strings.TrimPrefix(s.Items.Ref, "#/components/schemas/")
-			if refName != "" {
-				if nested, ok := a.typeRegistry[refName]; ok {
-					a.addSchemaAndRefsToModels(refName, nested)
-				}
-			}
-		}
+		visitSchemaRefs(*s.Items, fn)
 	}
 }
 

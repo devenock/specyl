@@ -144,7 +144,7 @@ func (a *Analyzer) responseBodyIdentNames(fd *ast.FuncDecl, recvName string) map
 			return true
 		}
 		var bodyExpr ast.Expr
-		if a.framework == models.FrameWorkGorilla || a.framework == models.FrameWorkChi {
+		if a.usesNetHTTPHandlers() {
 			bodyExpr, _ = matchJSONEncode(call, recvName)
 		} else if rc, ok := a.recognizeResponseCall(call, recvName, nil); ok && rc.hasBody {
 			bodyExpr = rc.bodyExpr

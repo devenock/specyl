@@ -307,7 +307,7 @@ func (a *Analyzer) findFileWithFunction(pkgName, funcName string) string {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		fset := token.NewFileSet()

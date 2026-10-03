@@ -88,6 +88,102 @@ func TestSwaggerGenerate_RealProjectOutputIsValidOpenAPI(t *testing.T) {
 	validateOpenAPI(t, filepath.Join(dir, "openapi.json"))
 }
 
+func TestSwaggerGenerate_AnalyzedProjectsAreValidOpenAPI(t *testing.T) {
+	tests := []struct {
+		name, framework, source string
+	}{
+		{
+			// Go 1.22+ ServeMux patterns used to leak the method into the path ("GET /items").
+			name: "net/http method patterns",
+			source: `package main
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+type Item struct {
+	ID string ` + "`json:\"id\"`" + `
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items/{id}", GetItem)
+	mux.HandleFunc("POST /items", CreateItem)
+}
+
+func GetItem(w http.ResponseWriter, r *http.Request) {}
+
+func CreateItem(w http.ResponseWriter, r *http.Request) {
+	var it Item
+	json.NewDecoder(r.Body).Decode(&it)
+	json.NewEncoder(w).Encode(it)
+}
+`,
+		},
+		{
+			// A struct referenced only through an array property used to be left out of components.
+			name:      "refs nested in array properties",
+			framework: "gin",
+			source: `package main
+
+import "github.com/gin-gonic/gin"
+
+type Address struct {
+	City string ` + "`json:\"city\"`" + `
+}
+
+type User struct {
+	Addresses []Address ` + "`json:\"addresses\"`" + `
+}
+
+func main() {
+	r := gin.Default()
+	r.GET("/users", GetUser)
+}
+
+func GetUser(c *gin.Context) {
+	c.JSON(200, User{})
+}
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			projectPath := t.TempDir()
+			files := map[string]string{
+				"go.mod":  "module example.com/api\n\ngo 1.24\n",
+				"main.go": tt.source,
+			}
+			for name, content := range files {
+				if err := os.WriteFile(filepath.Join(projectPath, name), []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cfg := &config.Config{
+				ProjectPath: projectPath,
+				Framework:   tt.framework,
+				DocType:     "swagger",
+				Title:       "Test API",
+				Version:     "1.0.0",
+				Quiet:       true,
+			}
+			spec, err := analyzer.NewAnalyzer(cfg).Analyze()
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+
+			cfg.Output = t.TempDir()
+			if err := NewSwaggerGenerator(cfg).Generate(spec); err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			validateOpenAPI(t, filepath.Join(cfg.Output, "openapi.json"))
+		})
+	}
+}
+
 func kitchenSinkSpec() *models.APISpec {
 	return &models.APISpec{
 		Title:       "Kitchen Sink API",
