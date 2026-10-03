@@ -3,6 +3,7 @@ package analyzer
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1377,5 +1378,237 @@ func TestAnalyze_TagsFilter_Unset_KeepsEverything(t *testing.T) {
 	spec := analyze(t, dir, "gin")
 	if len(spec.Endpoints) != 2 {
 		t.Errorf("expected both endpoints with no --tags filter, got %v", spec.Endpoints)
+	}
+}
+
+func TestAnalyze_NetHTTP_MethodPatterns(t *testing.T) {
+	dir := writeProject(t, map[string]string{
+		"go.mod": "module example.com/api\n\ngo 1.24\n",
+		"main.go": `package main
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+type Item struct {
+	ID   string ` + "`json:\"id\"`" + `
+	Name string ` + "`json:\"name\"`" + `
+}
+
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items", ListItems)
+	mux.HandleFunc("POST /items", CreateItem)
+	mux.HandleFunc("DELETE  api.example.com/items/{id}", DeleteItem)
+	mux.HandleFunc("GET /files/{path...}", ServeFile)
+	mux.HandleFunc("GET /{$}", Home)
+	mux.HandleFunc("/legacy", Home)
+	mux.HandleFunc("CONNECT /tunnel", Home)
+	http.ListenAndServe(":8080", mux)
+}
+
+func ListItems(w http.ResponseWriter, r *http.Request) {}
+
+// CreateItem creates an item.
+func CreateItem(w http.ResponseWriter, r *http.Request) {
+	var it Item
+	json.NewDecoder(r.Body).Decode(&it)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(it)
+}
+
+func DeleteItem(w http.ResponseWriter, r *http.Request) {}
+func ServeFile(w http.ResponseWriter, r *http.Request)  {}
+func Home(w http.ResponseWriter, r *http.Request)       {}
+`,
+	})
+
+	spec := analyze(t, dir, "")
+
+	findEndpoint(t, spec, "GET", "/items")
+	findEndpoint(t, spec, "GET", "/")
+	findEndpoint(t, spec, "GET", "/legacy")
+
+	create := findEndpoint(t, spec, "POST", "/items")
+	if create.RequestTypeName != "Item" {
+		t.Errorf("RequestTypeName = %q, want Item (from json.NewDecoder(r.Body).Decode(&it))", create.RequestTypeName)
+	}
+	if resp, ok := create.Responses[201]; !ok || resp.Content["application/json"].Schema.Properties["name"].Type != "string" {
+		t.Errorf("Responses = %v, want 201 with the Item schema", create.Responses)
+	}
+	if !strings.Contains(create.Description, "creates an item") {
+		t.Errorf("Description = %q, want it to include the doc comment", create.Description)
+	}
+
+	del := findEndpoint(t, spec, "DELETE", "/items/{id}")
+	if len(del.Parameters) != 1 || del.Parameters[0].Name != "id" {
+		t.Errorf("DeleteItem params = %+v, want a single path param \"id\"", del.Parameters)
+	}
+
+	file := findEndpoint(t, spec, "GET", "/files/{path}")
+	if len(file.Parameters) != 1 || file.Parameters[0].Name != "path" {
+		t.Errorf("ServeFile params = %+v, want a single path param \"path\"", file.Parameters)
+	}
+
+	for _, ep := range spec.Endpoints {
+		if !strings.HasPrefix(ep.Path, "/") {
+			t.Errorf("path %q does not start with /", ep.Path)
+		}
+		if ep.Method == "CONNECT" || ep.Path == "/tunnel" {
+			t.Errorf("CONNECT can't be represented in OpenAPI 3.0, want it skipped, got %s %s", ep.Method, ep.Path)
+		}
+	}
+}
+
+func TestParseServeMuxPattern(t *testing.T) {
+	tests := []struct {
+		pattern, method, path string
+		ok                    bool
+	}{
+		{"/items", "GET", "/items", true},
+		{"POST /items", "POST", "/items", true},
+		{"get /items", "GET", "/items", true},
+		{"PUT\t/items/{id}", "PUT", "/items/{id}", true},
+		{"example.com/items", "GET", "/items", true},
+		{"PATCH example.com/items/{id}", "PATCH", "/items/{id}", true},
+		{"GET /static/{rest...}", "GET", "/static/{rest}", true},
+		{"GET /{$}", "GET", "/", true},
+		{"GET /users/{$}", "GET", "/users/", true},
+		{"CONNECT /tunnel", "", "", false},
+		{"GET example.com", "", "", false},
+	}
+	for _, tt := range tests {
+		method, path, ok := parseServeMuxPattern(tt.pattern)
+		if method != tt.method || path != tt.path || ok != tt.ok {
+			t.Errorf("parseServeMuxPattern(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				tt.pattern, method, path, ok, tt.method, tt.path, tt.ok)
+		}
+	}
+}
+
+func TestAnalyze_IgnoresRoutesAndTypesInTestFiles(t *testing.T) {
+	dir := writeProject(t, map[string]string{
+		"go.mod": "module example.com/api\n\ngo 1.24\n",
+		"main.go": `package main
+
+import "github.com/gin-gonic/gin"
+
+type Payload struct {
+	Name string ` + "`json:\"name\"`" + `
+}
+
+func main() {
+	r := gin.Default()
+	r.POST("/things", Create)
+}
+
+func Create(c *gin.Context) {
+	var p Payload
+	c.ShouldBindJSON(&p)
+}
+`,
+		"main_test.go": `package main
+
+import "github.com/gin-gonic/gin"
+
+type Payload struct {
+	TestOnly bool ` + "`json:\"test_only\"`" + `
+}
+
+func setupRouter() *gin.Engine {
+	r := gin.New()
+	r.GET("/only-in-tests", Create)
+	return r
+}
+`,
+	})
+
+	spec := analyze(t, dir, "gin")
+
+	for _, ep := range spec.Endpoints {
+		if ep.Path == "/only-in-tests" {
+			t.Errorf("route registered in a _test.go file leaked into the spec: %s %s", ep.Method, ep.Path)
+		}
+	}
+	create := findEndpoint(t, spec, "POST", "/things")
+	schema := spec.Models["Payload"]
+	if _, ok := schema.Properties["name"]; !ok || create.RequestTypeName != "Payload" {
+		t.Errorf("Payload schema = %+v, want the main.go definition (with \"name\"), not the _test.go one", schema)
+	}
+}
+
+func TestAnalyze_EveryRefResolvesToAComponent(t *testing.T) {
+	dir := writeProject(t, map[string]string{
+		"go.mod": "module example.com/api\n\ngo 1.24\n",
+		"main.go": `package main
+
+import "github.com/gin-gonic/gin"
+
+type Address struct {
+	City string ` + "`json:\"city\"`" + `
+}
+
+type Tag struct {
+	Label string ` + "`json:\"label\"`" + `
+}
+
+type Category struct {
+	Name     string     ` + "`json:\"name\"`" + `
+	Children []Category ` + "`json:\"children\"`" + `
+	Tags     [][]Tag    ` + "`json:\"tags\"`" + `
+}
+
+type Owner struct {
+	Name string ` + "`json:\"name\"`" + `
+}
+
+type User struct {
+	Addresses []Address ` + "`json:\"addresses\"`" + `
+	Category  *Category ` + "`json:\"category\"`" + `
+}
+
+func main() {
+	r := gin.Default()
+	r.GET("/users", GetUser)
+	r.GET("/local", GetLocal)
+}
+
+func GetUser(c *gin.Context) {
+	c.JSON(200, User{})
+}
+
+func GetLocal(c *gin.Context) {
+	type envelope struct {
+		Owner Owner ` + "`json:\"owner\"`" + `
+	}
+	c.JSON(200, envelope{})
+}
+`,
+	})
+
+	spec := analyze(t, dir, "gin")
+
+	check := func(where string, s models.Schema) {
+		visitSchemaRefs(s, func(refName string) {
+			if _, ok := spec.Models[refName]; !ok {
+				t.Errorf("%s references #/components/schemas/%s, which is missing from Models", where, refName)
+			}
+		})
+	}
+	for _, ep := range spec.Endpoints {
+		for status, resp := range ep.Responses {
+			for _, c := range resp.Content {
+				check(ep.Method+" "+ep.Path+" response "+strconv.Itoa(status), c.Schema)
+			}
+		}
+	}
+	for name, s := range spec.Models {
+		check("model "+name, s)
+	}
+	for _, name := range []string{"User", "Address", "Category", "Tag", "Owner"} {
+		if _, ok := spec.Models[name]; !ok {
+			t.Errorf("Models is missing %s", name)
+		}
 	}
 }

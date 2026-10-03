@@ -177,7 +177,7 @@ func (a *Analyzer) Analyze() (*models.APISpec, error) {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		return a.collectTypesInFile(path)
@@ -198,7 +198,7 @@ func (a *Analyzer) Analyze() (*models.APISpec, error) {
 			}
 			return nil
 		}
-		if filepath.Ext(path) != ".go" {
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		return a.parseFile(path)
@@ -246,6 +246,8 @@ func (a *Analyzer) Analyze() (*models.APISpec, error) {
 
 	// Filter by --tags, if set. Must run after tags are fully assigned above.
 	a.endpoints = a.filterEndpointsByTags(a.endpoints)
+
+	a.addModelsReferencedByEndpoints()
 
 	// Create API spec
 	spec := &models.APISpec{

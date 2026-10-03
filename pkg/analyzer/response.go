@@ -108,6 +108,15 @@ func substArg(expr ast.Expr, subst map[string]ast.Expr) ast.Expr {
 	return expr
 }
 
+// usesNetHTTPHandlers reports whether handlers are plain func(http.ResponseWriter, *http.Request) — true for Gorilla, Chi, and the generic net/http fallback.
+func (a *Analyzer) usesNetHTTPHandlers() bool {
+	switch a.framework {
+	case models.FrameWorkGorilla, models.FrameWorkChi, models.FrameWorkUnknown:
+		return true
+	}
+	return false
+}
+
 func (a *Analyzer) recognizeResponseCall(call *ast.CallExpr, recvName string, subst map[string]ast.Expr) (responseCall, bool) {
 	switch a.framework {
 	case models.FrameWorkGin:
@@ -582,7 +591,7 @@ func (a *Analyzer) extractResponsesDepth(file *ast.File, funcName string, subst 
 	varTypes, _, _, _ := collectLocalTypedVars(fd.Body)
 	responses := make(map[int]models.Response)
 
-	if a.framework == models.FrameWorkGorilla || a.framework == models.FrameWorkChi {
+	if a.usesNetHTTPHandlers() {
 		a.walkNetHTTPResponses(file, funcName, fd, recvName, varTypes, responses)
 		return responses
 	}
